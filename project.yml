@@ -1,0 +1,133 @@
+name: MealRotation
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  developmentLanguage: en
+  knownRegions: [en, zh-Hans, zh-Hant]
+settings:
+  base:
+    APP_ID: com.hgsldswk.mealrotation
+    APP_STORE_ID: ""
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+targets:
+  MealRotation:
+    type: application
+    platform: iOS
+    sources: [MealRotation, Shared]
+    dependencies:
+      - target: MealRotationWidget
+        embed: true
+      - sdk: libsqlite3.tbd
+    entitlements:
+      path: MealRotation/MealRotation.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.hgsldswk.mealrotation]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_ID)
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        Release:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Distribution
+          PROVISIONING_PROFILE_SPECIFIER: MealRotation AppStore
+    info:
+      path: MealRotation/Info.plist
+      properties:
+        CFBundleDisplayName: Meal Rotation
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        ITSAppUsesNonExemptEncryption: false
+        APP_STORE_ID: $(APP_STORE_ID)
+        MealProProductID: $(APP_ID).pro
+        MealTrialProductID: $(APP_ID).trial
+        CFBundleURLTypes:
+          - CFBundleURLSchemes: [mealrotation]
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Meal Rotation Backup
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes: [com.hgsldswk.mealrotation.backup]
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.hgsldswk.mealrotation.backup
+            UTTypeDescription: Meal Rotation
+            UTTypeConformsTo: [public.json]
+            UTTypeTagSpecification:
+              public.filename-extension: [mealrotation]
+  MealRotationWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - MealRotationWidget
+      - path: Shared
+        excludes: [MenuTransfer.swift]
+    dependencies:
+      - sdk: libsqlite3.tbd
+    entitlements:
+      path: MealRotationWidget/MealRotationWidget.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.hgsldswk.mealrotation]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_ID).widget
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+      configs:
+        Release:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Distribution
+          PROVISIONING_PROFILE_SPECIFIER: MealRotation Widget AppStore
+    info:
+      path: MealRotationWidget/Info.plist
+      properties:
+        CFBundleDisplayName: Meal Rotation
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+  MealRotationTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [MealRotationTests, Shared]
+    dependencies:
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_ID).tests
+        GENERATE_INFOPLIST_FILE: YES
+  MealRotationUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [MealRotationUITests]
+    dependencies:
+      - target: MealRotation
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_ID).uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: MealRotation
+schemes:
+  MealRotation:
+    build:
+      targets:
+        MealRotation: all
+        MealRotationTests: [test]
+    test:
+      config: Debug
+      targets: [MealRotationTests]
+  MealRotationUI:
+    build:
+      targets:
+        MealRotation: all
+        MealRotationUITests: [test]
+    test:
+      config: Debug
+      targets: [MealRotationUITests]

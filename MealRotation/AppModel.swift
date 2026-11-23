@@ -1,0 +1,359 @@
+import StoreKit
+import SwiftUI
+import UIKit
+import WidgetKit
+
+enum AppPage: String { case tonight, menu, history }
+
+enum AppSheet: Identifiable {
+    case add, edit(Dinner), archived, picker(LocalDay, DinnerLog?), importCode(String?), backup(MenuBackup)
+    case share(ShareContent), settings, paywall, weekly, widgetHelp, activity([Any])
+    var id: String {
+        switch self {
+        case .add: "add"
+        case .edit: "edit"
+        case .archived: "archived"
+        case .picker: "picker"
+        case .importCode: "import"
+        case .backup: "backup"
+        case .share: "share"
+        case .settings: "settings"
+        case .paywall: "paywall"
+        case .weekly: "weekly"
+        case .widgetHelp: "widget"
+        case .activity: "activity"
+        }
+    }
+}
+
+@MainActor
+final class AppModel: ObservableObject {
+    @Published private(set) var state: DinnerState?
+    @Published private(set) var now = Date()
+    @Published private(set) var busy = false
+    @Published var page = AppPage.tonight
+    @Published var sheet: AppSheet?
+    @Published var message: String?
+    @Published var shareRequested = false
+    @Published var pendingActivity: [Any]?
+    @Published private(set) var products: [Product] = []
+    @Published private(set) var purchasing = false
+
+    private var store: DinnerStore?
+    private var loading = false
+    private var refreshing = false
+    private var revision = 0
+    private let firstLaunch = Date()
+    private let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1"
+    private let proID = Bundle.main.object(forInfoDictionaryKey: "MealProProductID") as? String ?? "com.hgsldswk.mealrotation.pro"
+    private let trialID = Bundle.main.object(forInfoDictionaryKey: "MealTrialProductID") as? String ?? "com.hgsldswk.mealrotation.trial"
+
+    var today: LocalDay { LocalDay(now) }
+    var premium: Bool { state?.entitlement.hasPro(at: now) == true }
+    var todayLog: DinnerLog? { state?.log(on: today) }
+    var choices: [DinnerChoice] { state?.choices(on: today, now: now) ?? [] }
+    var canShuffle: Bool {
+        guard let state, choices.count == 3 else { return false }
+        return state.dinners.filter { !$0.archived && (!(premium && state.quickOnly) || $0.quick) }.count > 3
+    }
+    var proProduct: Product? { products.first { $0.id == proID } }
+    var trialProduct: Product? { products.first { $0.id == trialID } }
+    var showTrialClaim: Bool { state?.entitlement.trialClaimedAt == nil && state?.entitlement.purchasedPro == false && premium }
+    var testing: Bool { Launch.testing }
+
+    func start() async {
+        guard state == nil, !loading else { return }
+        loading = true
+        defer { loading = false }
+        let instant = firstLaunch
+        let args = Launch.arguments
+        do {
+            let loaded = try await Task.detached(priority: .userInitiated) {
+                let testing = args.contains("-ui-testing")
+                let store: DinnerStore
+                if testing {
+                    let url = FileManager.default.temporaryDirectory.appendingPathComponent("ui-dinners.sqlite")
+                    if args.contains("-reset"), FileManager.default.fileExists(atPath: url.path) {
+                        try FileManager.default.removeItem(at: url)
+                    }
+                    store = DinnerStore(url: url)
+                } else {
+                    store = try DinnerStore.shared()
+                }
+                let baseline = testing || Launch.isFree ? instant : TrialKeychain.firstOpen(instant)
+                let (_, state) = try store.update(defaultDate: baseline) { state in
+                    if testing && args.contains("-demo") { state = Demo.state(at: instant) }
+                    if testing && args.contains("-expired") {
+                        state.entitlement = Entitlement(firstOpen: instant.addingTimeInterval(-40 * 86_400))
+                    }
+                }
+                return (store, state)
+            }.value
+            store = loaded.0
+            state = loaded.1
+            now = .now
+            if testing && args.contains("-paywall") { sheet = .paywall }
+        } catch {
+            self.message = L.t("storage_error")
+        }
+    }
+
+    func refresh() async {
+        now = .now
+        guard !busy, !refreshing, let store else { return }
+        refreshing = true
+        defer { refreshing = false }
+        let revision = self.revision
+        do {
+            let snapshot = try await Task.detached(priority: .utility) { try store.read() }.value
+            if !busy, revision == self.revision, state != snapshot { state = snapshot }
+            now = .now
+        } catch {
+            self.message = L.t("storage_error")
+        }
+    }
+
+    @discardableResult
+    func edit<T>(reportError: Bool = true, _ operation: @escaping (inout DinnerState) throws -> T) async -> T? {
+        guard let store, !busy else { return nil }
+        busy = true
+        revision += 1
+        defer { busy = false }
+        do {
+            let (result, snapshot) = try await Task.detached(priority: .userInitiated) {
+                try store.update(operation)
+            }.value
+            state = snapshot
+            now = .now
+            if !testing { WidgetCenter.shared.reloadTimelines(ofKind: Launch.widgetKind) }
+            return result
+        } catch {
+            state = (try? await Task.detached { try store.read() }.value) ?? state
+            now = .now
+            if reportError { self.message = Self.errorText(error) }
+            return nil
+        }
+    }
+
+    func log(_ choice: DinnerChoice) async {
+        guard let store, !busy else { return }
+        let day = today
+        if testing && Launch.arguments.contains("-fail-log") {
+            message = L.t("storage_error")
+            return
+        }
+        busy = true
+        revision += 1
+        defer { busy = false }
+        do {
+            let (_, snapshot) = try await Task.detached(priority: .userInitiated) {
+                try store.logCandidate(day: day, id: choice.id)
+            }.value
+            state = snapshot
+            now = .now
+            if !testing { WidgetCenter.shared.reloadTimelines(ofKind: Launch.widgetKind) }
+        } catch {
+            state = (try? await Task.detached { try store.read() }.value) ?? state
+            now = .now
+            self.message = Self.errorText(error)
+        }
+    }
+
+    func pick(_ day: LocalDay, expected: DinnerLog?, dinner: Dinner?, kind: DinnerKind) async -> Bool {
+        let wasToday = day == today
+        let changed = await edit { state in
+            let instant = Date()
+            let zone = TimeZone.current
+            let current = LocalDay(instant, zone: zone)
+            guard day <= current, !wasToday || current == day else { throw DinnerError.staleDay }
+            return try state.record(on: day, dinnerID: dinner?.id, kind: kind, replacing: expected?.id,
+                                    now: instant, zone: zone, countForReview: wasToday && expected == nil)
+        }
+        return changed != nil
+    }
+
+    func shuffle() async {
+        let day = today
+        await edit { (state: inout DinnerState) -> Void in
+            let instant = Date()
+            guard LocalDay(instant) == day, state.log(on: day) == nil else { throw DinnerError.staleDay }
+            state.shuffle(on: day, now: instant)
+        }
+    }
+
+    func undo(_ entry: DinnerLog) async {
+        await edit { (state: inout DinnerState) -> Void in
+            guard LocalDay(.now) == entry.day else { throw DinnerError.staleDay }
+            try state.undo(entry)
+        }
+    }
+
+    func add(_ text: String) async -> Bool {
+        let changed: Void? = await edit { state in
+            let names = Rotation.lines(text, existing: state.dinners)
+            guard !names.isEmpty else { throw DinnerError.invalidName }
+            state.dinners += names.map { Dinner(name: $0) }
+            state.batch = nil
+        }
+        return changed != nil
+    }
+
+    func save(_ dinner: Dinner) async -> Bool {
+        let changed: Void? = await edit { state in
+            let name = Rotation.cleaned(dinner.name)
+            guard Rotation.validName(name) else { throw DinnerError.invalidName }
+            guard !state.dinners.contains(where: { $0.id != dinner.id && Rotation.nameKey($0.name) == Rotation.nameKey(name) }) else {
+                throw DinnerError.duplicateName
+            }
+            guard let index = state.dinners.firstIndex(where: { $0.id == dinner.id }) else { throw DinnerError.staleChoice }
+            var normalized = dinner
+            normalized.name = name
+            state.dinners[index] = normalized
+            state.batch = nil
+        }
+        return changed != nil
+    }
+
+    func clickPaste() {
+        let code = testing ? ProcessInfo.processInfo.environment["UI_MENU_CODE"] : UIPasteboard.general.string
+        sheet = .importCode(code)
+    }
+
+    func share(_ objects: [Any], insideSheet: Bool = false) {
+        if testing {
+            shareRequested = true
+        } else if insideSheet {
+            pendingActivity = objects
+            sheet = nil
+        } else {
+            sheet = .activity(objects)
+        }
+    }
+
+    func export(backup: Bool) async {
+        guard let state else { return }
+        shareRequested = false
+        do {
+            let url = try await Task.detached(priority: .utility) {
+                let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                let url = folder.appendingPathComponent(backup ? "dinners.mealrotation" : "dinner-history.csv")
+                let data = try backup ? MenuBackup(state: state).encoded() : MenuBackup.csv(state.logs)
+                try data.write(to: url, options: .atomic)
+                return url
+            }.value
+            share([url])
+        } catch {
+            self.message = L.t("export_error")
+        }
+    }
+
+    func readBackup(_ url: URL) async {
+        do {
+            let backup = try await Task.detached(priority: .userInitiated) {
+                let access = url.startAccessingSecurityScopedResource()
+                defer { if access { url.stopAccessingSecurityScopedResource() } }
+                let file = try FileHandle(forReadingFrom: url)
+                defer { try? file.close() }
+                guard let data = try file.read(upToCount: MenuBackup.maxSize + 1) else { throw DinnerError.invalidBackup }
+                return try MenuBackup.read(data)
+            }.value
+            sheet = .backup(backup)
+        } catch {
+            self.message = L.t("invalid_backup")
+        }
+    }
+
+    var ratingCandidate: UUID? {
+        guard !testing, let state, state.coreDays.count >= 3, state.ratedVersion != version,
+              let entry = todayLog, state.coreDays.contains(entry.day) else { return nil }
+        return entry.id
+    }
+
+    func markRated(_ id: UUID) async -> Bool {
+        let version = version
+        let day = today
+        let changed: Void? = await edit(reportError: false) { state in
+            guard LocalDay(.now) == day, state.log(on: day)?.id == id, state.ratedVersion != version else {
+                throw DinnerError.changedRecord
+            }
+            state.ratedVersion = version
+        }
+        return changed != nil
+    }
+
+    func loadProducts() async {
+        guard !testing, !Launch.isFree else { return }
+        products = (try? await Product.products(for: [proID, trialID])) ?? []
+    }
+
+    func trackPurchases() async {
+        guard !testing, !Launch.isFree else { return }
+        for await result in StoreKit.Transaction.updates {
+            guard case .verified(let transaction) = result,
+                  [proID, trialID].contains(transaction.productID) else { continue }
+            if await refreshPurchases() { await transaction.finish() }
+        }
+    }
+
+    @discardableResult
+    func refreshPurchases() async -> Bool {
+        guard !testing, !Launch.isFree, state != nil else { return false }
+        var pro = false
+        var trial: Date?
+        for await result in StoreKit.Transaction.currentEntitlements {
+            guard case .verified(let transaction) = result, transaction.revocationDate == nil else { continue }
+            if transaction.productID == proID { pro = true }
+            if transaction.productID == trialID { trial = min(trial ?? transaction.originalPurchaseDate, transaction.originalPurchaseDate) }
+        }
+        if state?.entitlement.purchasedPro == pro,
+           trial.map({ receipt in state?.entitlement.trialClaimedAt.map { $0 <= receipt } == true }) ?? true { return true }
+        for _ in 0..<50 {
+            if !busy { break }
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return false }
+        }
+        let purchased = pro
+        let claimed = trial
+        let changed: Void? = await edit(reportError: false) { $0.entitlement.applyPurchases(pro: purchased, trial: claimed) }
+        return changed != nil
+    }
+
+    func purchase(_ product: Product) async {
+        guard !purchasing else { return }
+        purchasing = true
+        defer { purchasing = false }
+        do {
+            switch try await product.purchase() {
+            case .success(.verified(let transaction)):
+                if await refreshPurchases() { await transaction.finish() }
+                else { message = L.t("purchase_error") }
+            case .success(.unverified): message = L.t("purchase_error")
+            case .pending: message = L.t("purchase_pending")
+            case .userCancelled: break
+            @unknown default: message = L.t("purchase_error")
+            }
+        } catch { self.message = L.t("purchase_error") }
+    }
+
+    func restore() async {
+        guard !purchasing else { return }
+        if testing { message = L.t("restore_empty"); return }
+        purchasing = true
+        defer { purchasing = false }
+        do {
+            try await AppStore.sync()
+            guard await refreshPurchases() else { message = L.t("restore_error"); return }
+            message = L.t(state?.entitlement.purchasedPro == true || state?.entitlement.trialClaimedAt != nil ? "restore_ok" : "restore_empty")
+        } catch { self.message = L.t("restore_error") }
+    }
+
+    static func errorText(_ error: Error) -> String {
+        switch error as? DinnerError {
+        case .invalidName: L.t("invalid_name")
+        case .duplicateName: L.t("duplicate_name")
+        case .staleDay, .staleChoice: L.t("stale")
+        case .alreadyLogged, .changedRecord: L.t("changed")
+        default: L.t("storage_error")
+        }
+    }
+}
